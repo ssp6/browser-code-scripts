@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tradify Service Reminder Auto-Sync
 // @namespace    https://github.com/ssp6/browser-code-scripts
-// @version      1.1.1
+// @version      1.1.2
 // @description  Automatically create, update, and delete service reminders when Service Due Date is updated on jobs
 // @author       MPH Data
 // @match        https://go.tradifyhq.com/*
@@ -11,6 +11,8 @@
 // @downloadURL  https://raw.githubusercontent.com/ssp6/browser-code-scripts/main/tradify-service-reminder-sync.user.js
 // ==/UserScript==
 
+
+// Visible here: https://github.com/ssp6/browser-code-scripts/blob/main/tradify-service-reminder-sync.user.js
 (function() {
     'use strict';
 
