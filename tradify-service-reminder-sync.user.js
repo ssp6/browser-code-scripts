@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Tradify Service Reminder Auto-Sync
-// @namespace    http://tampermonkey.net/
+// @namespace    https://github.com/ssp6/browser-code-scripts
 // @version      1.1.1
 // @description  Automatically create, update, and delete service reminders when Service Due Date is updated on jobs
 // @author       MPH Data
 // @match        https://go.tradifyhq.com/*
 // @grant        none
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/ssp6/browser-code-scripts/main/tradify-service-reminder-sync.user.js
+// @downloadURL  https://raw.githubusercontent.com/ssp6/browser-code-scripts/main/tradify-service-reminder-sync.user.js
 // ==/UserScript==
 
 (function() {
