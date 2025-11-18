@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tradify Service Reminder Auto-Sync
 // @namespace    https://github.com/ssp6/browser-code-scripts
-// @version      1.1.2
+// @version      1.3.0
 // @description  Automatically create, update, and delete service reminders when Service Due Date is updated on jobs
 // @author       MPH Data
 // @match        https://go.tradifyhq.com/*
@@ -29,6 +29,7 @@
     // ==================== STATE ====================
     let currentJobData = null;
     let antiForgeryToken = null;  // Capture from actual API calls
+    let currentReminderButton = null;  // Reference to floating button
 
     // ==================== UTILITY FUNCTIONS ====================
 
@@ -68,6 +69,38 @@
     }
 
     /**
+     * Validate if a date string is valid and not in the past
+     * @param {string} dateString - The date string to validate
+     * @returns {object} - { isValid: boolean, isPast: boolean, error: string }
+     */
+    function validateServiceDate(dateString) {
+        // Check if date string is provided
+        if (!dateString || dateString.trim() === '') {
+            return { isValid: false, isPast: false, error: 'Date is empty' };
+        }
+
+        // Try to parse the date
+        const date = new Date(dateString);
+        
+        // Check if date is valid
+        if (isNaN(date.getTime())) {
+            return { isValid: false, isPast: false, error: 'Invalid date format' };
+        }
+
+        // Check if date is in the past (compare to today at midnight)
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const serviceDate = new Date(date);
+        serviceDate.setHours(0, 0, 0, 0);
+        
+        if (serviceDate < today) {
+            return { isValid: false, isPast: true, error: 'Date is in the past' };
+        }
+
+        return { isValid: true, isPast: false, error: null };
+    }
+
+    /**
      * Get service reminder URL
      */
     function getServiceReminderUrl(reminderId) {
@@ -75,6 +108,94 @@
     }
 
     // ==================== UI NOTIFICATIONS ====================
+
+    /**
+     * Show a floating button to view the service reminder
+     * @param {object} reminder - The service reminder object
+     */
+    function showReminderButton(reminder) {
+        // Remove existing button if any
+        if (currentReminderButton) {
+            currentReminderButton.remove();
+            currentReminderButton = null;
+        }
+
+        if (!reminder) return;
+
+        // Create floating button
+        const button = document.createElement('a');
+        button.id = 'service-reminder-view-button';
+        button.href = getServiceReminderUrl(reminder.Id);
+        button.target = '_blank';
+        button.style.cssText = `
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 14px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.4);
+            z-index: 9999;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        `;
+
+        // Format due date for display
+        const dueDate = new Date(reminder.DueDate);
+        const formattedDate = dueDate.toLocaleDateString('en-US', { 
+            month: 'short', 
+            day: 'numeric', 
+            year: 'numeric' 
+        });
+
+        button.innerHTML = `
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                <line x1="16" y1="2" x2="16" y2="6"></line>
+                <line x1="8" y1="2" x2="8" y2="6"></line>
+                <line x1="3" y1="10" x2="21" y2="10"></line>
+            </svg>
+            <span>Service Reminder: ${formattedDate}</span>
+        `;
+
+        // Add hover effect
+        button.addEventListener('mouseenter', () => {
+            button.style.transform = 'translateY(-2px)';
+            button.style.boxShadow = '0 6px 25px rgba(102, 126, 234, 0.5)';
+        });
+
+        button.addEventListener('mouseleave', () => {
+            button.style.transform = 'translateY(0)';
+            button.style.boxShadow = '0 4px 20px rgba(102, 126, 234, 0.4)';
+        });
+
+        document.body.appendChild(button);
+        currentReminderButton = button;
+    }
+
+    /**
+     * Hide the floating reminder button
+     */
+    function hideReminderButton() {
+        if (currentReminderButton) {
+            currentReminderButton.style.transition = 'opacity 0.3s';
+            currentReminderButton.style.opacity = '0';
+            setTimeout(() => {
+                if (currentReminderButton) {
+                    currentReminderButton.remove();
+                    currentReminderButton = null;
+                }
+            }, 300);
+        }
+    }
 
     /**
      * Show a notification popup with optional link
@@ -512,12 +633,25 @@
             
             // Capture job data when page loads
             if (url && url.includes('/Job/GetJobDetailData')) {
-                this.addEventListener('load', function() {
+                this.addEventListener('load', async function() {
                     try {
                         const data = JSON.parse(this.responseText);
                         if (data?.ChildData?.JobStaffMembers?.[0]?.Job) {
                             currentJobData = data.ChildData.JobStaffMembers[0].Job;
                             console.log('[ServiceReminder] Job loaded:', currentJobData.JobNumber);
+                            
+                            // Search for existing reminder and show button if found
+                            const jobId = currentJobData.Id;
+                            if (jobId) {
+                                const existingReminder = await findServiceReminderByJob(jobId);
+                                if (existingReminder) {
+                                    console.log('[ServiceReminder] Found existing reminder, showing button');
+                                    showReminderButton(existingReminder);
+                                } else {
+                                    console.log('[ServiceReminder] No existing reminder found');
+                                    hideReminderButton();
+                                }
+                            }
                         }
                     } catch (e) {
                         console.error('[ServiceReminder] Error parsing job data:', e);
@@ -547,6 +681,38 @@
                                 setTimeout(async () => {
                                     try {
                                         if (serviceDueDate && serviceDueDate.trim() !== '') {
+                                            // Validate the date before creating/updating
+                                            const validation = validateServiceDate(serviceDueDate);
+                                            
+                                            if (!validation.isValid) {
+                                                // Show error notification for invalid date
+                                                showNotification(
+                                                    `⚠️ Invalid Service Due Date<br><br>` +
+                                                    `<strong>Job:</strong> ${jobNumber}<br>` +
+                                                    `<strong>Date:</strong> ${serviceDueDate}<br>` +
+                                                    `<strong>Reason:</strong> ${validation.error}<br><br>` +
+                                                    `<em>Service reminder not ${existingReminder ? 'updated' : 'created'}</em>`,
+                                                    'error'
+                                                );
+                                                
+                                                // If there's an existing reminder for a now-invalid date, delete it
+                                                if (existingReminder) {
+                                                    const deleted = await deleteServiceReminder(existingReminder);
+                                                    if (deleted) {
+                                                        showNotification(
+                                                            `🗑️ Existing Reminder Deleted<br><br>` +
+                                                            `<strong>Job:</strong> ${jobNumber}<br>` +
+                                                            `<strong>Number:</strong> ${existingReminder.ServiceReminderNumber}<br><br>` +
+                                                            `<em>Date was ${validation.isPast ? 'in the past' : 'invalid'}</em>`,
+                                                            'info'
+                                                        );
+                                                        // Hide the floating button
+                                                        hideReminderButton();
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            
                                             if (existingReminder) {
                                                 // Update existing reminder
                                                 const updated = await updateServiceReminder(existingReminder, serviceDueDate);
@@ -560,6 +726,8 @@
                                                         'success',
                                                         reminderUrl
                                                     );
+                                                    // Update the floating button
+                                                    showReminderButton(updated);
                                                 }
                                             } else {
                                                 // Create new reminder
@@ -574,6 +742,8 @@
                                                         'success',
                                                         reminderUrl
                                                     );
+                                                    // Show the floating button
+                                                    showReminderButton(created);
                                                 }
                                             }
                                         } else {
@@ -587,6 +757,8 @@
                                                         `<strong>Number:</strong> ${existingReminder.ServiceReminderNumber}`,
                                                         'success'
                                                     );
+                                                    // Hide the floating button
+                                                    hideReminderButton();
                                                 }
                                             } else {
                                                 // No action needed
