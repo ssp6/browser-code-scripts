@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tradify Service Reminder Auto-Sync
 // @namespace    https://github.com/ssp6/browser-code-scripts
-// @version      2.0.0
+// @version      2.1.0
 // @description  Automatically create, update, and delete service reminders when Service Due Date is updated on jobs
 // @author       MPH Data
 // @match        https://go.tradifyhq.com/*
@@ -22,12 +22,21 @@
         TENANT_ID: '00000000-0000-0000-0000-000000000000',
         DESCRIPTION: 'Automated creation',
         EMAIL_SEND_MODE: 1,  // 1 = Manual, 2 = Automatic
-        EMAIL_TEMPLATE_ID: null
+        EMAIL_TEMPLATE_ID: null,
+        // Performance settings for slow connections/computers
+        API_TIMEOUT: 30000,           // 30 seconds timeout
+        MAX_RETRIES: 3,               // Retry failed requests 3 times
+        RETRY_DELAY: 1000,            // Initial retry delay 1s
+        SAVE_DEBOUNCE_DELAY: 2000,    // Wait 2s after last save before processing
+        PAGE_STATE_DELAY: 1500,       // Wait 1.5s for page state to update
+        AUTH_TOKEN_RETRY_DELAY: 500,  // Check for auth token every 500ms
+        AUTH_TOKEN_MAX_WAIT: 10000    // Wait max 10s for auth token
     };
 
     // ==================== STATE ====================
     let currentJobData = null;
     let currentButton = null;
+    let saveDebounceTimer = null;
 
     // ==================== LOGGING ====================
     
@@ -128,6 +137,27 @@
             log('Failed to get auth token from localStorage', 'error');
         }
         return null;
+    }
+
+    async function waitForAuthToken() {
+        const token = getAuthToken();
+        if (token) {
+            return token;
+        }
+
+        log('Auth token not available, waiting...', 'warning');
+        
+        const startTime = Date.now();
+        while (Date.now() - startTime < CONFIG.AUTH_TOKEN_MAX_WAIT) {
+            await new Promise(resolve => setTimeout(resolve, CONFIG.AUTH_TOKEN_RETRY_DELAY));
+            const token = getAuthToken();
+            if (token) {
+                log('Auth token acquired', 'success');
+                return token;
+            }
+        }
+
+        throw new Error('Auth token not available after waiting');
     }
 
     // ==================== UI - BUTTON STATES ====================
@@ -316,11 +346,7 @@
                 serviceReminderListFilter: 1
             };
 
-            const token = getAuthToken();
-            if (!token) {
-                log('No auth token available for search', 'warning');
-                return null;
-            }
+            const token = await waitForAuthToken();
 
             const response = await makeApiRequest(
                 `${CONFIG.BASE_URL}/ServiceReminder/GetServiceReminderList`,
@@ -385,10 +411,7 @@
                 saveOptions: {}
             };
 
-            const token = getAuthToken();
-            if (!token) {
-                throw new Error('No auth token available');
-            }
+            const token = await waitForAuthToken();
 
             const response = await makeApiRequest(
                 `${CONFIG.BASE_URL}/SaveChanges/SaveChanges`,
@@ -448,10 +471,7 @@
                 saveOptions: {}
             };
 
-            const token = getAuthToken();
-            if (!token) {
-                throw new Error('No auth token available');
-            }
+            const token = await waitForAuthToken();
 
             const response = await makeApiRequest(
                 `${CONFIG.BASE_URL}/SaveChanges/SaveChanges`,
@@ -506,10 +526,7 @@
                 saveOptions: {}
             };
 
-            const token = getAuthToken();
-            if (!token) {
-                throw new Error('No auth token available');
-            }
+            const token = await waitForAuthToken();
 
             await makeApiRequest(
                 `${CONFIG.BASE_URL}/SaveChanges/SaveChanges`,
@@ -526,7 +543,7 @@
         }
     }
 
-    function makeApiRequest(url, method, payload, token) {
+    function makeApiRequest(url, method, payload, token, attempt = 1) {
         return new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
             xhr.open(method, url);
@@ -534,6 +551,9 @@
             xhr.setRequestHeader('accept', 'application/json, text/plain, */*');
             xhr.setRequestHeader('clientapiversion', '69');
             xhr.setRequestHeader('requestverificationantiforgerytoken', token);
+
+            // Set timeout
+            xhr.timeout = CONFIG.API_TIMEOUT;
 
             xhr.onload = function() {
                 if (xhr.status === 200) {
@@ -548,7 +568,19 @@
             };
 
             xhr.onerror = () => reject(new Error('Network error'));
+            
+            xhr.ontimeout = () => reject(new Error('Request timeout'));
+
             xhr.send(JSON.stringify(payload));
+        }).catch(async (error) => {
+            // Retry logic
+            if (attempt < CONFIG.MAX_RETRIES) {
+                const delay = CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1); // Exponential backoff
+                log(`Request failed (attempt ${attempt}/${CONFIG.MAX_RETRIES}), retrying in ${delay}ms: ${error.message}`, 'warning');
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return makeApiRequest(url, method, payload, token, attempt + 1);
+            }
+            throw error;
         });
     }
 
@@ -609,8 +641,8 @@
         // Search for existing reminder
         const existingReminder = await searchForReminder(jobId, jobNumber);
 
-        // Small delay to ensure page state is updated
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Longer delay to ensure page state is updated (especially on slow machines)
+        await new Promise(resolve => setTimeout(resolve, CONFIG.PAGE_STATE_DELAY));
 
         try {
             if (serviceDueDate && serviceDueDate.trim() !== '') {
@@ -750,17 +782,27 @@
                     if (entity?.entityAspect?.entityTypeName === 'Job:#Tradify.Models' && 'Custom4' in entity) {
                         const serviceDueDate = entity.Custom4;
 
-                        // Wait for save to complete, then process
+                        // Wait for save to complete, then process with debouncing
                         this.addEventListener('load', async function() {
-                            try {
-                                await handleJobSave(serviceDueDate);
-                            } catch (error) {
-                                log(`Save handling error: ${error.message}`, 'error');
-                                showNotification(
-                                    `❌ Error processing save<br><br>Check console for details`,
-                                    'error'
-                                );
+                            // Clear any existing debounce timer
+                            if (saveDebounceTimer) {
+                                clearTimeout(saveDebounceTimer);
+                                log('Debouncing rapid save...', 'info');
                             }
+
+                            // Set new debounce timer
+                            saveDebounceTimer = setTimeout(async () => {
+                                try {
+                                    await handleJobSave(serviceDueDate);
+                                } catch (error) {
+                                    log(`Save handling error: ${error.message}`, 'error');
+                                    showNotification(
+                                        `❌ Error processing save<br><br>Check console for details`,
+                                        'error'
+                                    );
+                                }
+                                saveDebounceTimer = null;
+                            }, CONFIG.SAVE_DEBOUNCE_DELAY);
                         });
                     }
                 } catch (e) {
@@ -789,7 +831,7 @@
     // ==================== INITIALIZATION ====================
     
     function init() {
-        log('Service Reminder Auto-Sync v2.0.0', 'info');
+        log('Service Reminder Auto-Sync v2.1.0 (Optimized for slow connections)', 'info');
 
         // Set up XHR interception immediately (must be before any page loads)
         setupXHRInterception();
