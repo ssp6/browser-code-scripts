@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tradify Service Reminder Auto-Sync
 // @namespace    https://github.com/ssp6/browser-code-scripts
-// @version      2.1.0
+// @version      2.2.0
 // @description  Automatically create, update, and delete service reminders when Service Due Date is updated on jobs
 // @author       MPH Data
 // @match        https://go.tradifyhq.com/*
@@ -30,13 +30,17 @@
         SAVE_DEBOUNCE_DELAY: 2000,    // Wait 2s after last save before processing
         PAGE_STATE_DELAY: 1500,       // Wait 1.5s for page state to update
         AUTH_TOKEN_RETRY_DELAY: 500,  // Check for auth token every 500ms
-        AUTH_TOKEN_MAX_WAIT: 10000    // Wait max 10s for auth token
+        AUTH_TOKEN_MAX_WAIT: 10000,   // Wait max 10s for auth token
+        LOADING_TIMEOUT: 30000,       // 30s timeout for initial job data load
+        LOADING_CHECK_INTERVAL: 5000  // Check loading state every 5s
     };
 
     // ==================== STATE ====================
     let currentJobData = null;
     let currentButton = null;
     let saveDebounceTimer = null;
+    let loadingStateTimer = null;
+    let jobDataLoadStartTime = null;
 
     // ==================== LOGGING ====================
     
@@ -235,6 +239,44 @@
 
     function showLoadingButton() {
         createBaseButton('#9CA3AF', '#6B7280', 'Plugin Loading...', null);
+        jobDataLoadStartTime = Date.now();
+        
+        // Clear any existing timer
+        if (loadingStateTimer) {
+            clearTimeout(loadingStateTimer);
+        }
+        
+        // Set up timeout to check loading state
+        loadingStateTimer = setTimeout(checkLoadingTimeout, CONFIG.LOADING_TIMEOUT);
+        
+        // Periodic logging to show it's still waiting
+        let checkCount = 0;
+        const periodicCheck = setInterval(() => {
+            checkCount++;
+            if (!currentJobData && isOnJobPage()) {
+                const elapsed = ((Date.now() - jobDataLoadStartTime) / 1000).toFixed(1);
+                log(`Still waiting for job data... (${elapsed}s elapsed)`, 'info');
+            } else {
+                clearInterval(periodicCheck);
+            }
+        }, CONFIG.LOADING_CHECK_INTERVAL);
+    }
+    
+    function checkLoadingTimeout() {
+        if (!currentJobData && isOnJobPage()) {
+            const elapsed = ((Date.now() - jobDataLoadStartTime) / 1000).toFixed(1);
+            log(`Job data load timeout after ${elapsed}s - retrying...`, 'warning');
+            
+            // Try to manually fetch job data
+            const jobId = getJobIdFromUrl();
+            if (jobId) {
+                log(`Attempting manual job data fetch for job ID: ${jobId}`, 'info');
+                manuallyFetchJobData(jobId);
+            } else {
+                log('Cannot retry: no job ID found in URL', 'error');
+                showNoReminderButton('Unknown');
+            }
+        }
     }
 
     function showCheckingButton(jobNumber) {
@@ -571,7 +613,12 @@
             
             xhr.ontimeout = () => reject(new Error('Request timeout'));
 
-            xhr.send(JSON.stringify(payload));
+            // Send payload only for POST/PUT requests
+            if (payload) {
+                xhr.send(JSON.stringify(payload));
+            } else {
+                xhr.send();
+            }
         }).catch(async (error) => {
             // Retry logic
             if (attempt < CONFIG.MAX_RETRIES) {
@@ -587,24 +634,67 @@
     // ==================== NAVIGATION HANDLING ====================
     
     function handleNavigationChange() {
+        const jobId = getJobIdFromUrl();
         if (isOnJobPage()) {
-            log('Navigated to job page', 'info');
-            // Button will update when job data loads via XHR intercept
+            log(`Navigated to job page (ID: ${jobId})`, 'info');
+            // Clear any existing timers
+            if (loadingStateTimer) {
+                clearTimeout(loadingStateTimer);
+            }
+            // Show loading and wait for job data
+            showLoadingButton();
         } else {
             log('Left job page', 'info');
             hideButton();
             currentJobData = null;
+            if (loadingStateTimer) {
+                clearTimeout(loadingStateTimer);
+                loadingStateTimer = null;
+            }
         }
     }
 
     // ==================== JOB DATA HANDLING ====================
     
+    async function manuallyFetchJobData(jobId) {
+        try {
+            log(`Manually fetching job data for ID: ${jobId}`, 'info');
+            
+            const token = await waitForAuthToken();
+            const response = await makeApiRequest(
+                `${CONFIG.BASE_URL}/Job/GetJobDetailData?id=${jobId}`,
+                'GET',
+                null,
+                token
+            );
+            
+            const jobData = response?.ChildData?.JobStaffMembers?.[0]?.Job;
+            if (jobData) {
+                log('Manual job data fetch successful', 'success');
+                await handleJobDataLoaded(jobData);
+            } else {
+                log('Manual fetch returned no job data', 'error');
+                showNoReminderButton('Unknown');
+            }
+        } catch (error) {
+            log(`Manual fetch failed: ${error.message}`, 'error');
+            showNoReminderButton('Error');
+        }
+    }
+    
     async function handleJobDataLoaded(jobData) {
+        // Clear loading timeout
+        if (loadingStateTimer) {
+            clearTimeout(loadingStateTimer);
+            loadingStateTimer = null;
+        }
+        
         currentJobData = jobData;
         const jobNumber = jobData.JobNumber;
         const jobId = jobData.Id;
         
-        log(`Job loaded: ${jobNumber}`, 'info');
+        const loadTime = jobDataLoadStartTime ? ((Date.now() - jobDataLoadStartTime) / 1000).toFixed(1) : 'N/A';
+        log(`Job loaded: ${jobNumber} (took ${loadTime}s)`, 'success');
 
         // Only update button if still on a job page
         if (!isOnJobPage()) {
@@ -758,17 +848,30 @@
 
             // Intercept: Job detail data loading
             if (url && url.includes('/Job/GetJobDetailData')) {
+                log('Job detail data request detected', 'debug');
+                
                 this.addEventListener('load', async function() {
+                    log(`Job detail data response received (status: ${this.status})`, 'debug');
                     try {
                         const data = JSON.parse(this.responseText);
                         const jobData = data?.ChildData?.JobStaffMembers?.[0]?.Job;
                         
                         if (jobData) {
                             await handleJobDataLoaded(jobData);
+                        } else {
+                            log('Job detail response had no job data', 'warning');
                         }
                     } catch (e) {
                         log(`Error parsing job data: ${e.message}`, 'error');
                     }
+                });
+                
+                this.addEventListener('error', function() {
+                    log('Job detail data request failed (network error)', 'error');
+                });
+                
+                this.addEventListener('timeout', function() {
+                    log('Job detail data request timed out', 'error');
                 });
             }
 
@@ -831,7 +934,7 @@
     // ==================== INITIALIZATION ====================
     
     function init() {
-        log('Service Reminder Auto-Sync v2.1.0 (Optimized for slow connections)', 'info');
+        log('Service Reminder Auto-Sync v2.2.0 (Enhanced logging & timeout handling)', 'info');
 
         // Set up XHR interception immediately (must be before any page loads)
         setupXHRInterception();
